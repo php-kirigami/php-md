@@ -1138,6 +1138,380 @@ static void php_mdhtml_process_emoji(cmark_node *doc) {
 }
 
 /* ========================================================================
+ * EXTENDED INLINE SYNTAX: ==highlight==, ^superscript^, ~subscript~
+ *
+ * None of these are CommonMark or GFM; MD:: implements them as three
+ * plain regex passes over already-escaped HTML text. Here, each is a
+ * TEXT-node split-and-wrap: the matched span becomes a
+ * CMARK_NODE_CUSTOM_INLINE node (cmark's own "opaque literal HTML
+ * fragment" inline node -- no new cmark_syntax_extension needed) whose
+ * on_enter/on_exit are the literal open/close tags, wrapping a TEXT child
+ * with the captured content; the original TEXT node is split into
+ * [before, wrap, after...] around each match.
+ *
+ * `~~strikethrough~~` never reaches the subscript pass as leftover single
+ * tildes: cmark-gfm's own strikethrough extension already consumes real
+ * `~~...~~` spans *during parsing*, before any of these passes run, so
+ * whatever single `~` survives in a TEXT node by the time this runs is
+ * genuinely single-tilde usage -- no manual precedence juggling needed
+ * between the two, unlike MD::'s regex passes which must explicitly order
+ * strikethrough before subscript.
+ * ======================================================================== */
+static void php_mdhtml_set_literal_range(cmark_node *node, const char *start, size_t len) {
+	char *buf = emalloc(len + 1);
+	memcpy(buf, start, len);
+	buf[len] = '\0';
+	cmark_node_set_literal(node, buf);
+	efree(buf);
+}
+
+static void php_mdhtml_wrap_delim(cmark_node *text_node, const char *delim, size_t delim_len, const char *open_tag, const char *close_tag) {
+	const char *lit = cmark_node_get_literal(text_node);
+	size_t len, i = 0, seg_start = 0;
+	int replaced = 0;
+
+	if (!lit) return;
+	len = strlen(lit);
+
+	while (i + delim_len <= len) {
+		if (memcmp(lit + i, delim, delim_len) == 0) {
+			size_t j = i + delim_len;
+			while (j + delim_len <= len && memcmp(lit + j, delim, delim_len) != 0 && lit[j] != '\n') j++;
+			if (j + delim_len <= len && memcmp(lit + j, delim, delim_len) == 0 && j > i + delim_len) {
+				cmark_node *wrap, *inner;
+
+				if (i > seg_start) {
+					cmark_node *before = cmark_node_new(CMARK_NODE_TEXT);
+					php_mdhtml_set_literal_range(before, lit + seg_start, i - seg_start);
+					cmark_node_insert_before(text_node, before);
+				}
+
+				wrap = cmark_node_new(CMARK_NODE_CUSTOM_INLINE);
+				cmark_node_set_on_enter(wrap, open_tag);
+				cmark_node_set_on_exit(wrap, close_tag);
+				inner = cmark_node_new(CMARK_NODE_TEXT);
+				php_mdhtml_set_literal_range(inner, lit + i + delim_len, j - (i + delim_len));
+				cmark_node_append_child(wrap, inner);
+				cmark_node_insert_before(text_node, wrap);
+
+				replaced = 1;
+				seg_start = j + delim_len;
+				i = j + delim_len;
+				continue;
+			}
+		}
+		i++;
+	}
+
+	if (replaced) {
+		if (seg_start < len) {
+			cmark_node *after = cmark_node_new(CMARK_NODE_TEXT);
+			php_mdhtml_set_literal_range(after, lit + seg_start, len - seg_start);
+			cmark_node_insert_before(text_node, after);
+		}
+		cmark_node_unlink(text_node);
+		cmark_node_free(text_node);
+	}
+}
+
+static void php_mdhtml_apply_delim_pass(cmark_node *doc, const char *delim, size_t delim_len, const char *open_tag, const char *close_tag) {
+	cmark_node **nodes = NULL;
+	size_t count = 0, capacity = 0;
+	cmark_iter *iter = cmark_iter_new(doc);
+	cmark_event_type ev;
+
+	while ((ev = cmark_iter_next(iter)) != CMARK_EVENT_DONE) {
+		cmark_node *node = cmark_iter_get_node(iter);
+		if (ev == CMARK_EVENT_ENTER && cmark_node_get_type(node) == CMARK_NODE_TEXT) {
+			if (count == capacity) {
+				capacity = capacity ? capacity * 2 : 16;
+				nodes = erealloc(nodes, capacity * sizeof(cmark_node *));
+			}
+			nodes[count++] = node;
+		}
+	}
+	cmark_iter_free(iter);
+
+	{
+		size_t i;
+		for (i = 0; i < count; i++) {
+			php_mdhtml_wrap_delim(nodes[i], delim, delim_len, open_tag, close_tag);
+		}
+	}
+	if (nodes) efree(nodes);
+}
+
+/* ========================================================================
+ * GFM-STYLE ALERTS (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`,
+ * `[!CAUTION]`)
+ *
+ * GitHub's own convention, not part of cmark-gfm (or GFM itself) -- it
+ * parses as a plain blockquote whose first paragraph starts with the
+ * literal text "[!NOTE]" etc. Detected as a tree transform (unlike
+ * headings/links/tasklist, which are cheap string patches): a
+ * blockquote's rendering has to change from `<blockquote>` to a
+ * `<div class="markdown-alert ...">` with an injected title paragraph, and
+ * cmark's HTML renderer has no per-node-instance hook for a built-in type
+ * like CMARK_NODE_BLOCK_QUOTE. Solved by rendering the (marker-stripped)
+ * blockquote's content to HTML *early* (via a scratch CMARK_NODE_DOCUMENT
+ * holding its stolen children, using the same options/extensions as the
+ * real, outer render so nested tables/tasklists/etc still work), building
+ * the final wrapped HTML by hand, and swapping the whole blockquote for a
+ * single CMARK_NODE_HTML_BLOCK holding that literal -- which, under
+ * CMARK_OPT_UNSAFE, survives into the real render completely untouched.
+ *
+ * Processed in *reverse* document order on purpose: a nested blockquote
+ * (an alert inside another blockquote, or an alert inside an alert) is
+ * converted first, so that when its ancestor is processed next, moving
+ * the ancestor's children into a scratch document either doesn't touch
+ * the nested one at all, or picks it up as an already-finished
+ * CMARK_NODE_HTML_BLOCK (rendered verbatim, correctly nested) -- not as a
+ * cmark_node this code has already freed. Processing outer-to-inner
+ * instead would free the inner blockquote out from under this function's
+ * own collected node list before it's reached, a real use-after-free.
+ * ======================================================================== */
+typedef struct {
+	const char *marker;
+	const char *class_suffix;
+	const char *label;
+} php_mdhtml_alert_type;
+
+static const php_mdhtml_alert_type php_mdhtml_alert_types[] = {
+	{"[!NOTE]", "note", "NOTE"},
+	{"[!TIP]", "tip", "TIP"},
+	{"[!IMPORTANT]", "important", "IMPORTANT"},
+	{"[!WARNING]", "warning", "WARNING"},
+	{"[!CAUTION]", "caution", "CAUTION"},
+};
+
+static zend_string *php_mdhtml_render_alert_body(cmark_node *blockquote, int options, cmark_llist *extensions) {
+	cmark_node *temp_doc = cmark_node_new(CMARK_NODE_DOCUMENT);
+	cmark_node *child;
+	char *inner_html;
+	zend_string *result;
+
+	while ((child = cmark_node_first_child(blockquote)) != NULL) {
+		cmark_node_unlink(child);
+		cmark_node_append_child(temp_doc, child);
+	}
+
+	inner_html = cmark_render_html(temp_doc, options, extensions);
+	result = inner_html ? zend_string_init(inner_html, strlen(inner_html), 0) : ZSTR_EMPTY_ALLOC();
+	if (inner_html) free(inner_html);
+	cmark_node_free(temp_doc);
+	return result;
+}
+
+static void php_mdhtml_process_alerts(cmark_node *doc, int options, cmark_llist *extensions) {
+	cmark_node **blockquotes = NULL;
+	size_t count = 0, capacity = 0;
+	cmark_iter *iter = cmark_iter_new(doc);
+	cmark_event_type ev;
+
+	while ((ev = cmark_iter_next(iter)) != CMARK_EVENT_DONE) {
+		cmark_node *node = cmark_iter_get_node(iter);
+		if (ev == CMARK_EVENT_ENTER && cmark_node_get_type(node) == CMARK_NODE_BLOCK_QUOTE) {
+			if (count == capacity) {
+				capacity = capacity ? capacity * 2 : 8;
+				blockquotes = erealloc(blockquotes, capacity * sizeof(cmark_node *));
+			}
+			blockquotes[count++] = node;
+		}
+	}
+	cmark_iter_free(iter);
+
+	{
+		size_t idx;
+		for (idx = count; idx-- > 0; ) {
+			cmark_node *bq = blockquotes[idx];
+			cmark_node *first_para = cmark_node_first_child(bq);
+			cmark_node *marker_text;
+			const char *lit;
+			int type_idx = -1;
+			size_t t;
+
+			if (!first_para || cmark_node_get_type(first_para) != CMARK_NODE_PARAGRAPH) continue;
+			marker_text = cmark_node_first_child(first_para);
+			if (!marker_text || cmark_node_get_type(marker_text) != CMARK_NODE_TEXT) continue;
+			lit = cmark_node_get_literal(marker_text);
+			if (!lit) continue;
+
+			for (t = 0; t < sizeof(php_mdhtml_alert_types) / sizeof(php_mdhtml_alert_types[0]); t++) {
+				if (strcmp(lit, php_mdhtml_alert_types[t].marker) == 0) {
+					type_idx = (int) t;
+					break;
+				}
+			}
+			if (type_idx < 0) continue;
+
+			{
+				cmark_node *after_marker = cmark_node_next(marker_text);
+				cmark_node *html_block;
+				smart_str final_html = {0};
+				zend_string *inner;
+
+				cmark_node_unlink(marker_text);
+				cmark_node_free(marker_text);
+				if (after_marker && (cmark_node_get_type(after_marker) == CMARK_NODE_SOFTBREAK
+						|| cmark_node_get_type(after_marker) == CMARK_NODE_LINEBREAK)) {
+					cmark_node_unlink(after_marker);
+					cmark_node_free(after_marker);
+				}
+				if (!cmark_node_first_child(first_para)) {
+					cmark_node_unlink(first_para);
+					cmark_node_free(first_para);
+				}
+
+				inner = php_mdhtml_render_alert_body(bq, options, extensions);
+
+				smart_str_appends(&final_html, "<div class=\"markdown-alert markdown-alert-");
+				smart_str_appends(&final_html, php_mdhtml_alert_types[type_idx].class_suffix);
+				smart_str_appends(&final_html, "\"><p class=\"markdown-alert-title\">");
+				smart_str_appends(&final_html, php_mdhtml_alert_types[type_idx].label);
+				smart_str_appends(&final_html, "</p>");
+				smart_str_append(&final_html, inner);
+				smart_str_appends(&final_html, "</div>");
+				smart_str_0(&final_html);
+				zend_string_release(inner);
+
+				html_block = cmark_node_new(CMARK_NODE_HTML_BLOCK);
+				cmark_node_set_literal(html_block, ZSTR_VAL(final_html.s));
+				smart_str_free(&final_html);
+
+				cmark_node_replace(bq, html_block);
+				cmark_node_free(bq);
+			}
+		}
+	}
+	if (blockquotes) efree(blockquotes);
+}
+
+/* ========================================================================
+ * DEFINITION LISTS (extended syntax)
+ *   Term
+ *   : Definition
+ * Not CommonMark: with no blank line between them, "Term" and
+ * ": Definition" are just two soft-wrapped lines of the *same* paragraph
+ * as far as cmark is concerned (there's nothing block-level about a
+ * leading ':' to make it a separate block), so unlike alerts this can't
+ * be caught as a distinct node in the tree -- cmark has already merged
+ * them into one <p>text\n: text</p> by the time this runs. Implemented
+ * as a post-render string pass instead (php_mdhtml_process_definition_lists,
+ * run after php_mdhtml_postprocess()): scans for a `<p>` whose content,
+ * split on literal '\n', is a first "term" line followed by one or more
+ * ':'-prefixed "definition" lines, and rewrites it to a `<dl>`; consecutive
+ * such `<p>`s (separated only by whitespace) merge into one `<dl>`, the
+ * same continuation behavior MD::extractDefinitionLists() implements.
+ * ======================================================================== */
+static int php_mdhtml_is_colon_line(const char *s, size_t len) {
+	size_t i = 0;
+	while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+	if (i >= len || s[i] != ':') return 0;
+	i++;
+	if (i >= len || !(s[i] == ' ' || s[i] == '\t')) return 0;
+	while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+	return i < len;
+}
+
+static void php_mdhtml_colon_line_content(const char *s, size_t len, const char **out, size_t *out_len) {
+	size_t i = 0;
+	while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+	i++; /* ':' */
+	while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+	*out = s + i;
+	*out_len = len - i;
+}
+
+static zend_string *php_mdhtml_process_definition_lists(zend_string *html) {
+	smart_str out = {0};
+	const char *s = ZSTR_VAL(html);
+	size_t len = ZSTR_LEN(html);
+	size_t i = 0;
+
+	while (i < len) {
+		if (i + 3 <= len && memcmp(s + i, "<p>", 3) == 0) {
+			size_t scan = i;
+			smart_str dl_body = {0};
+			int matched_any = 0;
+			size_t after_all = i;
+
+			while (scan + 3 <= len && memcmp(s + scan, "<p>", 3) == 0) {
+				size_t content_start = scan + 3;
+				size_t content_end = content_start;
+				size_t first_line_end = (size_t) -1;
+				size_t k;
+
+				while (content_end < len && !(content_end + 4 <= len && memcmp(s + content_end, "</p>", 4) == 0)) {
+					content_end++;
+				}
+				if (content_end + 4 > len) break; /* unterminated, bail */
+
+				for (k = content_start; k < content_end; k++) {
+					if (s[k] == '\n') { first_line_end = k; break; }
+				}
+				if (first_line_end == (size_t) -1) break; /* single line: not a term+def shape */
+
+				if (php_mdhtml_is_colon_line(s + content_start, first_line_end - content_start)) {
+					break; /* the "term" line can't itself be a colon-line */
+				}
+
+				{
+					size_t pos = first_line_end + 1;
+					int all_rest_colon = (pos < content_end);
+					while (pos < content_end) {
+						size_t le = pos;
+						while (le < content_end && s[le] != '\n') le++;
+						if (!php_mdhtml_is_colon_line(s + pos, le - pos)) { all_rest_colon = 0; break; }
+						pos = le + 1;
+					}
+					if (!all_rest_colon) break;
+				}
+
+				smart_str_appends(&dl_body, "  <dt>");
+				smart_str_appendl(&dl_body, s + content_start, first_line_end - content_start);
+				smart_str_appends(&dl_body, "</dt>\n");
+				{
+					size_t pos = first_line_end + 1;
+					while (pos < content_end) {
+						size_t le = pos;
+						const char *dd;
+						size_t dd_len;
+						while (le < content_end && s[le] != '\n') le++;
+						php_mdhtml_colon_line_content(s + pos, le - pos, &dd, &dd_len);
+						smart_str_appends(&dl_body, "  <dd>");
+						smart_str_appendl(&dl_body, dd, dd_len);
+						smart_str_appends(&dl_body, "</dd>\n");
+						pos = le + 1;
+					}
+				}
+
+				matched_any = 1;
+				after_all = content_end + 4;
+
+				scan = after_all;
+				while (scan < len && (s[scan] == '\n' || s[scan] == ' ' || s[scan] == '\t' || s[scan] == '\r')) scan++;
+			}
+
+			if (matched_any) {
+				smart_str_appends(&out, "<dl>\n");
+				smart_str_append(&out, dl_body.s);
+				smart_str_appends(&out, "</dl>");
+				smart_str_free(&dl_body);
+				i = after_all;
+				continue;
+			}
+			smart_str_free(&dl_body);
+		}
+
+		smart_str_appendc(&out, s[i]);
+		i++;
+	}
+
+	smart_str_0(&out);
+	return out.s ? out.s : ZSTR_EMPTY_ALLOC();
+}
+
+/* ========================================================================
  * PLUGIN SYSTEM ({% name args %} inline, {% name args\nbody\n%} block)
  *
  * Ported from MD::'s plugin system (md.class.php STEP 2), but the
@@ -1451,8 +1825,8 @@ static const char *php_mdhtml_gfm_extensions[] = {
  * callback round-trip) without leaving MD::toHtml() itself to do it:
  * heading ids incl. the `{#id}` override syntax, emoji shortcodes, the
  * raw-HTML whitelist, external-link/image/task-list attribute shaping,
- * and the `{% plugin %}` system (`MDHtml\RegisterPlugin()`). Still
- * PHP-side: definition lists, GFM-style `> [!NOTE]` alerts, and the
+ * the `{% plugin %}` system (`MDHtml\RegisterPlugin()`), GFM-style
+ * `> [!NOTE]` alerts, definition lists, and the
  * `==highlight==`/`^sup^`/`~sub~` extended inline syntax.
  */
 PHP_FUNCTION(mdhtml_render)
@@ -1462,10 +1836,19 @@ PHP_FUNCTION(mdhtml_render)
 	php_mdhtml_plugin_outputs plugin_outputs = {0};
 	cmark_parser *parser;
 	cmark_node *document;
+	cmark_llist *extensions;
 	char *html;
 	zend_string *result;
 	php_mdhtml_id_list heading_ids = {0};
-	int options = CMARK_OPT_UNSAFE | CMARK_OPT_FOOTNOTES;
+	/* CMARK_OPT_STRIKETHROUGH_DOUBLE_TILDE: without it, cmark-gfm's own
+	 * strikethrough extension accepts a *single* ~tilde~ as strikethrough
+	 * too, which would greedily consume "H~2~O" during parsing before the
+	 * subscript pass below ever sees a literal '~' -- found by actually
+	 * testing subscript against strikethrough and getting <del>, not
+	 * <sub>. Restricting strikethrough to ~~double~~ tildes (matching
+	 * every real GFM implementation's actual behavior, e.g. GitHub's own)
+	 * leaves single tildes for MDHtml's own subscript syntax. */
+	int options = CMARK_OPT_UNSAFE | CMARK_OPT_FOOTNOTES | CMARK_OPT_STRIKETHROUGH_DOUBLE_TILDE;
 	int i;
 
 	ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1488,12 +1871,17 @@ PHP_FUNCTION(mdhtml_render)
 	cmark_parser_feed(parser, ZSTR_VAL(preprocessed), ZSTR_LEN(preprocessed));
 	document = cmark_parser_finish(parser);
 	zend_string_release(preprocessed);
+	extensions = cmark_parser_get_syntax_extensions(parser);
 
 	php_mdhtml_sanitize_raw_html_nodes(document);
 	php_mdhtml_process_emoji(document);
+	php_mdhtml_apply_delim_pass(document, "==", 2, "<mark>", "</mark>");
+	php_mdhtml_apply_delim_pass(document, "^", 1, "<sup>", "</sup>");
+	php_mdhtml_apply_delim_pass(document, "~", 1, "<sub>", "</sub>");
 	php_mdhtml_compute_heading_ids(document, &heading_ids);
+	php_mdhtml_process_alerts(document, options, extensions);
 
-	html = cmark_render_html(document, options, cmark_parser_get_syntax_extensions(parser));
+	html = cmark_render_html(document, options, extensions);
 
 	cmark_node_free(document);
 	cmark_parser_free(parser);
@@ -1507,6 +1895,12 @@ PHP_FUNCTION(mdhtml_render)
 	result = php_mdhtml_postprocess(html, strlen(html), &heading_ids);
 	free(html); /* libc allocator -- see cmark_parser_new() vs _with_mem() */
 	php_mdhtml_id_list_destroy(&heading_ids);
+
+	{
+		zend_string *with_dl = php_mdhtml_process_definition_lists(result);
+		zend_string_release(result);
+		result = with_dl;
+	}
 
 	if (plugin_outputs.count > 0) {
 		zend_string *injected = php_mdhtml_inject_plugins(result, &plugin_outputs);

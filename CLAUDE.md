@@ -342,6 +342,99 @@ much less fragile.
       `GetRegisteredPlugins()` before/after `UnregisterPlugin()`, and the
       fenced-code-block protection above — all via a throwaway
       `vendor/build/test.php`/`fence-test.php` (scratch, not committed).
+13. **The rest of point 10's "still PHP-side" list — `==highlight==`/
+    `^sup^`/`~sub~`, GFM-style `> [!NOTE]` alerts, and definition lists —
+    moved into the extension too**, closing out the migration point 10
+    started. Three different mechanisms, matched to what each syntax
+    actually needs:
+    - **`==highlight==`/`^sup^`/`~sub~`**: the `CMARK_NODE_CUSTOM_INLINE`
+      splice sketched in point 10 — `php_mdhtml_wrap_delim()` splits a
+      `TEXT` node into `[before, wrap, after...]` around each delimited
+      span, where `wrap` is a `CMARK_NODE_CUSTOM_INLINE` (cmark's own
+      "opaque literal HTML fragment" node — no `cmark_syntax_extension`
+      needed) with `on_enter`/`on_exit` set to the literal `<mark>`/
+      `</mark>` etc. and a `TEXT` child holding the captured content.
+      Generalized to accept a delimiter *string* (not just a char) so the
+      same function handles `^`/`~` (1 byte) and `==` (2 bytes). Three
+      separate tree walks (fresh `cmark_iter` each, per the established
+      "collect then mutate" pattern), one per delimiter, run after
+      emoji/before heading-id computation. **Real bug found and fixed**:
+      `H~2~O` rendered as `H<del>2</del>O`, not `H<sub>2</sub>O` — cmark-gfm's
+      own strikethrough extension accepts a *single* tilde as
+      strikethrough by default (only real GFM/GitHub restricts it to
+      `~~double~~`), so it was consuming `~2~` during parsing before the
+      subscript pass ever saw a literal `~`. Fixed by adding
+      `CMARK_OPT_STRIKETHROUGH_DOUBLE_TILDE` to the parser options —
+      caught by testing subscript directly against strikethrough in the
+      same input, not by inspection.
+    - **GFM-style alerts** (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`,
+      `[!WARNING]`, `[!CAUTION]`): a real tree transform
+      (`php_mdhtml_process_alerts()`), since — unlike headings/links/
+      tasklist, which are cheap string patches on cmark's *own* rendered
+      output — a blockquote's rendering has to change from `<blockquote>`
+      to `<div class="markdown-alert ...">`, and cmark's HTML renderer has
+      no per-node-instance hook for a built-in type like
+      `CMARK_NODE_BLOCK_QUOTE`. Solved by: detecting a `BLOCK_QUOTE` whose
+      first paragraph's first child is a `TEXT` node whose literal is
+      *exactly* one of the five markers (matching `MD::`'s own
+      `[!TYPE]`-alone-on-its-line requirement); stripping that marker
+      `TEXT` node and the `SOFTBREAK`/`LINEBREAK` after it; rendering the
+      (now marker-free) blockquote's remaining children early, via a
+      scratch `CMARK_NODE_DOCUMENT` that steals them
+      (`php_mdhtml_render_alert_body()`, passing the *same*
+      `cmark_parser_get_syntax_extensions(parser)` list the real render
+      uses, so nested tables/tasklists/etc. inside an alert still work);
+      building the final `<div class="markdown-alert markdown-alert-{type}">
+      <p class="markdown-alert-title">{LABEL}</p>{content}</div>` by hand;
+      and swapping the whole blockquote for a single
+      `CMARK_NODE_HTML_BLOCK` holding that literal via
+      `cmark_node_replace()` — which, under `CMARK_OPT_UNSAFE`, survives
+      into the real render completely untouched. **Processed in *reverse*
+      document order, deliberately** (collected via one top-down
+      `cmark_iter` pass first, then walked back-to-front): a nested
+      blockquote (an alert inside another blockquote, or an alert inside
+      an alert) has to be converted *before* its ancestor, or converting
+      the ancestor first would steal the nested one into a scratch
+      document, render it, and free it — leaving the *already-collected*
+      array holding a dangling pointer to it, a real use-after-free the
+      first time the loop reached that entry. Verified: a plain alert, an
+      alert containing a real GFM list, and — the actual nesting case
+      forward order would have crashed on — an alert containing a
+      genuine, non-alert nested blockquote (correctly stays a real
+      `<blockquote>`, not converted).
+      **Heading-id ordering note**: `php_mdhtml_compute_heading_ids()`
+      must run *before* `php_mdhtml_process_alerts()`, not after — a
+      heading inside an about-to-become-an-alert blockquote still needs
+      counting in the tree-walk (it's a real `CMARK_NODE_HEADING` at that
+      point), even though by the time the *string* post-process later
+      scans for `<h1>`-`<h6>` tags, that heading only exists as inert text
+      inside the alert's pre-baked `HTML_BLOCK` literal — the id still
+      gets assigned correctly since both passes count/scan headings in
+      the same left-to-right document order regardless of which one ends
+      up literal-vs-real by the time the final string exists.
+    - **Definition lists** (`Term` / `: Definition`): the only one of the
+      three that *can't* be a tree transform, because the syntax isn't
+      CommonMark at all — with no blank line between them, "Term" and
+      ": Definition" are just two soft-wrapped lines of the *same*
+      paragraph as far as cmark is concerned (nothing about a leading `:`
+      makes a new block start), so by the time there's a tree, cmark has
+      already merged them into one `<p>Term\n: Definition</p>`. Implemented
+      as a post-render *string* pass instead
+      (`php_mdhtml_process_definition_lists()`, run right after
+      `php_mdhtml_postprocess()`): finds a `<p>` whose content, split on
+      literal `\n`, is a "term" line followed by one-or-more `:`-prefixed
+      "definition" lines, and rewrites the whole thing to a `<dl>`;
+      consecutive such `<p>`s separated only by whitespace merge into one
+      `<dl>`, the same continuation behavior `MD::extractDefinitionLists()`
+      implements. Unlike that PHP version, this one does **not** skip a
+      `<p>` just because it contains inline HTML tags (`<strong>`, `<code>`,
+      a link, ...) — since cmark only ever wraps genuine inline-level
+      paragraph text in `<p>` in the first place (block content never ends
+      up there), any tags found inside are safe to carry straight into
+      `<dt>`/`<dd>` verbatim; verified with a bold term and an *emphasized*
+      `code`-containing definition.
+    - Full diff-test corpus (from point 11) re-run after all three — no
+      regressions.
 
 ## Relationship to other repos
 
@@ -422,23 +515,32 @@ plugins. Verified: inline usage, block usage (correctly unwrapped from
 its `<p>`), an unregistered name (stays literal), register/unregister
 round-trip, and the ```` ``` ```` fenced-code-block protection.
 
+**✅ Round 4 (2026-09-12, point 13 above): `==highlight==`/`^sup^`/`~sub~`,
+GFM alerts, and definition lists moved into the extension.** This closes
+out point 10's entire "still PHP-side" migration list — every
+`MD::toHtml()` post-processing step now has a C-side equivalent in
+`mdhtml.c` (~1850 lines) except the two deliberate, documented gaps below.
+Full diff-test corpus re-run, no regressions.
+
+**MD::toHtml() itself has not been changed to actually call
+`MDHtml\Render()` yet** — that integration (making `kirigami/php-prepros`
+depend on this extension and rewiring `MD::toHtml()` to delegate its
+structural core to it) is a `kirigami`-repo change, not a `php-mdhtml`
+one, and hasn't been started.
+
 **Not done yet:**
 
-1. Definition lists, GFM-style `> [!NOTE]` alerts, and the
-   `==highlight==`/`^sup^`/`~sub~` extended inline syntax (point 10's
-   "still PHP-side" list, now minus plugins) — `MD::toHtml()` keeps doing
-   these in PHP for now. All three could reuse the
-   `CMARK_NODE_CUSTOM_INLINE` splice pattern point 10 sketched out but
-   didn't implement (a text node split around the delimiter, wrapping the
-   captured content in a custom node whose `on_enter`/`on_exit` are
-   literal `<mark>`/`</mark>` etc.).
-2. Point 12's known limitation: a `{% %}` written inside a single-
+1. Point 12's known limitation: a `{% %}` written inside a single-
    backtick inline code span isn't protected from being treated as a live
    plugin invocation (only ```` ``` ```` fenced blocks are).
-3. `php_mdhtml_slugify()`'s ASCII-only limitation (point 10) — revisit if
+2. `php_mdhtml_slugify()`'s ASCII-only limitation (point 10) — revisit if
    a real non-ASCII heading anchor is needed.
-4. Only once the remaining PHP-side features above are either migrated or
-   deliberately left alone: port the build to Emscripten/WASM (JSPI),
-   following `php-wasm-compiler`'s own Dockerfile conventions, and settle
-   the vendoring question (point 5). Not started — everything so far is
+3. Wiring `kirigami/php-prepros`'s `MD::toHtml()` to actually call
+   `MDHtml\Render()` for its structural core, replacing the ~800 lines of
+   regex it currently uses for that part — a `kirigami` repo change, not
+   started.
+4. Only once that integration is done and validated against a real site:
+   port the build to Emscripten/WASM (JSPI), following
+   `php-wasm-compiler`'s own Dockerfile conventions, and settle the
+   vendoring question (point 5). Not started — everything so far is
    native-only (point 6).
