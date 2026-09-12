@@ -1,0 +1,38 @@
+# phpize / autoconf build artifacts
+/autom4te.cache/
+/build/
+/.deps/
+/.libs/
+/modules/
+/config.guess
+/config.h
+/config.h.in
+/config.log
+/config.nice
+/config.status
+/config.sub
+/configure
+/configure.ac
+/libtool
+/ltmain.sh
+/Makefile
+/Makefile.fragments
+/Makefile.global
+/Makefile.objects
+/mkinstalldirs
+/run-tests.php
+*.lo
+*.o
+*.so
+*.la
+
+# vendored third-party dependency sources/builds (decision 5 in CLAUDE.md —
+# not yet decided whether this lives here or in php-wasm-compiler, either
+# way nothing under vendor/ is hand-edited)
+/vendor/
+
+# editor/OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
