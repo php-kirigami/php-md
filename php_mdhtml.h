@@ -38,6 +38,7 @@ PHP_MINFO_FUNCTION(mdhtml);
 ZEND_BEGIN_MODULE_GLOBALS(mdhtml)
 	HashTable emoji_builtin;
 	HashTable emoji_custom;
+	HashTable plugins;
 ZEND_END_MODULE_GLOBALS(mdhtml)
 
 ZEND_EXTERN_MODULE_GLOBALS(mdhtml)

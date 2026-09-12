@@ -1138,6 +1138,302 @@ static void php_mdhtml_process_emoji(cmark_node *doc) {
 }
 
 /* ========================================================================
+ * PLUGIN SYSTEM ({% name args %} inline, {% name args\nbody\n%} block)
+ *
+ * Ported from MD::'s plugin system (md.class.php STEP 2), but the
+ * extraction happens on the raw Markdown *string*, exactly like MD::'s
+ * own STEP 2 does, and for the same reason: at this point nothing has
+ * been parsed yet, so there is no tree to hook a real cmark_syntax_extension
+ * into (and writing one would still need this same callback-into-PHP
+ * machinery for the plugin body). A registered plugin's PHP callback is
+ * called synchronously (call_user_function()) with ($args, $body) as
+ * MD::registerPlugin() documents, its return value is stashed, and the
+ * matched span is replaced with a placeholder (the same STX/ETX control-
+ * byte convention MD:: uses -- bytes with no Markdown meaning, guaranteed
+ * to survive cmark's own text escaping untouched) for cmark to parse
+ * around. After rendering, php_mdhtml_inject_plugins() swaps each
+ * placeholder for its real output.
+ *
+ * KNOWN LIMITATION (unlike MD::, which explicitly protects against this):
+ * a `{% %}` tag written *inside* a code span/block in the source is not
+ * detected as such here except for ``` fenced blocks (tracked via a
+ * simple "does this line start with ```" toggle) -- an inline single-
+ * backtick code span containing literal `{% %}` text is not excluded and
+ * would still be treated as a live plugin invocation. Revisit if this
+ * turns out to matter in practice (documenting Kirigami's own plugin
+ * syntax in a single-backtick code span, for instance).
+ * ======================================================================== */
+
+typedef struct {
+	zend_string *placeholder;
+	zend_string *output;
+} php_mdhtml_plugin_output;
+
+typedef struct {
+	php_mdhtml_plugin_output *items;
+	size_t count;
+	size_t capacity;
+} php_mdhtml_plugin_outputs;
+
+static void php_mdhtml_plugin_outputs_push(php_mdhtml_plugin_outputs *list, zend_string *placeholder, zend_string *output) {
+	if (list->count == list->capacity) {
+		list->capacity = list->capacity ? list->capacity * 2 : 8;
+		list->items = erealloc(list->items, list->capacity * sizeof(php_mdhtml_plugin_output));
+	}
+	list->items[list->count].placeholder = placeholder;
+	list->items[list->count].output = output;
+	list->count++;
+}
+
+static void php_mdhtml_plugin_outputs_destroy(php_mdhtml_plugin_outputs *list) {
+	size_t i;
+	for (i = 0; i < list->count; i++) {
+		zend_string_release(list->items[i].placeholder);
+		zend_string_release(list->items[i].output);
+	}
+	if (list->items) {
+		efree(list->items);
+	}
+}
+
+/* Tokenizes a plugin's inline argument string the same way MD::'s
+ * $parseArgs closure does: bare words, "double quoted" and 'single
+ * quoted' (both supporting backslash escapes, stripped the same way
+ * PHP's stripslashes() would). */
+static void php_mdhtml_parse_plugin_args(const char *raw, size_t len, zval *args_array) {
+	size_t i = 0;
+	array_init(args_array);
+
+	while (i < len) {
+		while (i < len && isspace((unsigned char) raw[i])) i++;
+		if (i >= len) break;
+
+		if (raw[i] == '"' || raw[i] == '\'') {
+			char quote = raw[i];
+			smart_str tok = {0};
+			i++;
+			while (i < len && raw[i] != quote) {
+				if (raw[i] == '\\' && i + 1 < len) {
+					smart_str_appendc(&tok, raw[i + 1]);
+					i += 2;
+					continue;
+				}
+				smart_str_appendc(&tok, raw[i]);
+				i++;
+			}
+			if (i < len) i++; /* past closing quote */
+			smart_str_0(&tok);
+			add_next_index_str(args_array, tok.s ? tok.s : ZSTR_EMPTY_ALLOC());
+		} else {
+			size_t start = i;
+			while (i < len && !isspace((unsigned char) raw[i])) i++;
+			add_next_index_stringl(args_array, raw + start, i - start);
+		}
+	}
+}
+
+static size_t php_mdhtml_trim_len(const char *s, size_t len) {
+	while (len > 0 && isspace((unsigned char) s[len - 1])) len--;
+	return len;
+}
+static size_t php_mdhtml_ltrim_start(const char *s, size_t len) {
+	size_t i = 0;
+	while (i < len && isspace((unsigned char) s[i])) i++;
+	return i;
+}
+
+/*
+ * Scans `md` for `{% name args %}` / `{% name args\nbody\n%}` spans,
+ * calling each registered plugin's PHP callback and replacing the span
+ * with a placeholder token; unregistered names are left completely
+ * untouched (cmark's own text-node HTML-escaping already makes a bare
+ * `{% unknown %}` safe to render as literal text, so unlike MD:: there is
+ * no need to pre-escape it here). Returns the rewritten Markdown as a new
+ * zend_string; `outputs` collects each placeholder's real HTML for
+ * php_mdhtml_inject_plugins() to substitute back in after rendering.
+ */
+static zend_string *php_mdhtml_extract_plugins(const char *md, size_t len, php_mdhtml_plugin_outputs *outputs) {
+	smart_str out = {0};
+	size_t i = 0;
+	size_t line_start = 0;
+	int in_fence = 0;
+
+	while (i < len) {
+		if (i == line_start && i + 3 <= len && md[i] == '`' && md[i + 1] == '`' && md[i + 2] == '`') {
+			in_fence = !in_fence;
+		}
+
+		if (!in_fence && i + 1 < len && md[i] == '{' && md[i + 1] == '%') {
+			size_t p = i + 2;
+			size_t name_start, name_len;
+			while (p < len && isspace((unsigned char) md[p])) p++;
+			name_start = p;
+			while (p < len && (isalnum((unsigned char) md[p]) || md[p] == '_' || md[p] == '-')) p++;
+			name_len = p - name_start;
+
+			if (name_len > 0) {
+				/* first '%}' from p onward is the tag's true end (matches
+				 * the non-greedy body group in MD::'s regex, which always
+				 * stops at the first "%}" it finds); a '\n' encountered
+				 * strictly before that close makes this block form. */
+				size_t k, first_newline = (size_t) -1, close = (size_t) -1;
+				for (k = p; k < len; k++) {
+					if (md[k] == '\n' && first_newline == (size_t) -1) {
+						first_newline = k;
+					}
+					if (k + 1 < len && md[k] == '%' && md[k + 1] == '}') {
+						close = k;
+						break;
+					}
+				}
+
+				if (close != (size_t) -1) {
+					size_t args_start = p, args_end;
+					const char *body_ptr = NULL;
+					size_t body_len = 0;
+					size_t match_end = close + 2;
+					size_t j;
+
+					if (first_newline != (size_t) -1 && first_newline < close) {
+						args_end = first_newline;
+						{
+							size_t bs = first_newline + 1;
+							size_t be = close;
+							bs += php_mdhtml_ltrim_start(md + bs, be - bs);
+							be = bs + php_mdhtml_trim_len(md + bs, be - bs);
+							body_ptr = md + bs;
+							body_len = be - bs;
+						}
+					} else {
+						args_end = close;
+					}
+					args_end = args_start + php_mdhtml_trim_len(md + args_start, args_end - args_start);
+
+					{
+						zend_string *key = zend_string_init(md + name_start, name_len, 0);
+						zend_str_tolower(ZSTR_VAL(key), ZSTR_LEN(key));
+						zval *callback = zend_hash_find(&MDHTML_G(plugins), key);
+						zend_string_release(key);
+
+						if (callback) {
+							zval args_array, body_zv, retval;
+							zval params[2];
+
+							php_mdhtml_parse_plugin_args(md + args_start, args_end - args_start, &args_array);
+							if (body_ptr) {
+								ZVAL_STRINGL(&body_zv, body_ptr, body_len);
+							} else {
+								ZVAL_EMPTY_STRING(&body_zv);
+							}
+							ZVAL_COPY_VALUE(&params[0], &args_array);
+							ZVAL_COPY_VALUE(&params[1], &body_zv);
+
+							ZVAL_UNDEF(&retval);
+							if (call_user_function(NULL, NULL, callback, &retval, 2, params) == SUCCESS
+								&& !Z_ISUNDEF(retval)) {
+								zend_string *output = zval_get_string(&retval);
+								zend_string *placeholder;
+								smart_str ph = {0};
+								smart_str_appends(&ph, "\x02PLG");
+								smart_str_append_long(&ph, (zend_long) outputs->count);
+								smart_str_appends(&ph, "\x03");
+								smart_str_0(&ph);
+								placeholder = ph.s;
+
+								smart_str_append(&out, placeholder);
+								php_mdhtml_plugin_outputs_push(outputs, zend_string_copy(placeholder), output);
+							}
+							zval_ptr_dtor(&retval);
+							zval_ptr_dtor(&args_array);
+							zval_ptr_dtor(&body_zv);
+
+							/* re-derive line_start/in_fence across the
+							 * consumed span (best-effort -- see the
+							 * KNOWN LIMITATION note above the section). */
+							for (j = i; j < match_end; j++) {
+								if (md[j] == '\n') line_start = j + 1;
+							}
+							i = match_end;
+							continue;
+						}
+					}
+
+					/* unregistered plugin name: leave the whole span
+					 * untouched, verbatim. */
+					smart_str_appendl(&out, md + i, match_end - i);
+					for (j = i; j < match_end; j++) {
+						if (md[j] == '\n') line_start = j + 1;
+					}
+					i = match_end;
+					continue;
+				}
+			}
+		}
+
+		if (md[i] == '\n') {
+			line_start = i + 1;
+		}
+		smart_str_appendc(&out, md[i]);
+		i++;
+	}
+
+	smart_str_0(&out);
+	return out.s ? out.s : ZSTR_EMPTY_ALLOC();
+}
+
+/* Substitutes each plugin placeholder for its real output in the final
+ * rendered HTML. A placeholder that ended up alone inside its own
+ * `<p>...</p>` (the common case for a block-style plugin used on its own
+ * line) has that wrapping `<p>`/`</p>` removed first -- otherwise a
+ * plugin returning block-level HTML (a `<div>`, an `<iframe>`, ...) would
+ * end up illegally nested inside a `<p>`, exactly the case MD::'s own
+ * STEP 13 paragraph-wrapping logic special-cases its `\x02PLG` marker
+ * for. */
+static zend_string *php_mdhtml_inject_plugins(zend_string *html, php_mdhtml_plugin_outputs *outputs) {
+	zend_string *current = zend_string_copy(html);
+	size_t i;
+
+	for (i = 0; i < outputs->count; i++) {
+		zend_string *placeholder = outputs->items[i].placeholder;
+		zend_string *output = outputs->items[i].output;
+		smart_str out = {0};
+		const char *s = ZSTR_VAL(current);
+		size_t len = ZSTR_LEN(current);
+		size_t plen = ZSTR_LEN(placeholder);
+		size_t pos = 0;
+		int found_any = 0;
+
+		while (pos < len) {
+			if (pos + plen <= len && memcmp(s + pos, ZSTR_VAL(placeholder), plen) == 0) {
+				if (out.s && ZSTR_LEN(out.s) >= 3 && memcmp(ZSTR_VAL(out.s) + ZSTR_LEN(out.s) - 3, "<p>", 3) == 0
+					&& pos + plen + 4 <= len && memcmp(s + pos + plen, "</p>", 4) == 0) {
+					ZSTR_LEN(out.s) -= 3; /* drop the "<p>" we already wrote */
+					smart_str_append(&out, output);
+					pos += plen + 4; /* also skip the matching "</p>" */
+				} else {
+					smart_str_append(&out, output);
+					pos += plen;
+				}
+				found_any = 1;
+				continue;
+			}
+			smart_str_appendc(&out, s[pos]);
+			pos++;
+		}
+
+		if (found_any) {
+			smart_str_0(&out);
+			zend_string_release(current);
+			current = out.s;
+		} else {
+			smart_str_free(&out);
+		}
+	}
+
+	return current;
+}
+
+/* ========================================================================
  * PHP-FACING FUNCTIONS
  * ======================================================================== */
 
@@ -1151,16 +1447,19 @@ static const char *php_mdhtml_gfm_extensions[] = {
 
 /*
  * Covers the CommonMark+GFM structural core plus everything that could be
- * done as tree/HTML transforms without a PHP round-trip: heading ids incl.
- * the `{#id}` override syntax, emoji shortcodes, the raw-HTML whitelist,
- * and external-link/image/task-list attribute shaping. Still PHP-side
- * (not yet migrated): the `{% plugin %}` system (needs a PHP callback
- * round-trip), definition lists, GFM-style `> [!NOTE]` alerts, and the
+ * done as tree/HTML transforms (or, for plugins, a synchronous PHP
+ * callback round-trip) without leaving MD::toHtml() itself to do it:
+ * heading ids incl. the `{#id}` override syntax, emoji shortcodes, the
+ * raw-HTML whitelist, external-link/image/task-list attribute shaping,
+ * and the `{% plugin %}` system (`MDHtml\RegisterPlugin()`). Still
+ * PHP-side: definition lists, GFM-style `> [!NOTE]` alerts, and the
  * `==highlight==`/`^sup^`/`~sub~` extended inline syntax.
  */
 PHP_FUNCTION(mdhtml_render)
 {
 	zend_string *markdown;
+	zend_string *preprocessed;
+	php_mdhtml_plugin_outputs plugin_outputs = {0};
 	cmark_parser *parser;
 	cmark_node *document;
 	char *html;
@@ -1173,6 +1472,10 @@ PHP_FUNCTION(mdhtml_render)
 		Z_PARAM_STR(markdown)
 	ZEND_PARSE_PARAMETERS_END();
 
+	preprocessed = zend_hash_num_elements(&MDHTML_G(plugins)) > 0
+		? php_mdhtml_extract_plugins(ZSTR_VAL(markdown), ZSTR_LEN(markdown), &plugin_outputs)
+		: zend_string_copy(markdown);
+
 	parser = cmark_parser_new(options);
 
 	for (i = 0; php_mdhtml_gfm_extensions[i]; i++) {
@@ -1182,8 +1485,9 @@ PHP_FUNCTION(mdhtml_render)
 		}
 	}
 
-	cmark_parser_feed(parser, ZSTR_VAL(markdown), ZSTR_LEN(markdown));
+	cmark_parser_feed(parser, ZSTR_VAL(preprocessed), ZSTR_LEN(preprocessed));
 	document = cmark_parser_finish(parser);
+	zend_string_release(preprocessed);
 
 	php_mdhtml_sanitize_raw_html_nodes(document);
 	php_mdhtml_process_emoji(document);
@@ -1196,12 +1500,20 @@ PHP_FUNCTION(mdhtml_render)
 
 	if (!html) {
 		php_mdhtml_id_list_destroy(&heading_ids);
+		php_mdhtml_plugin_outputs_destroy(&plugin_outputs);
 		RETURN_EMPTY_STRING();
 	}
 
 	result = php_mdhtml_postprocess(html, strlen(html), &heading_ids);
 	free(html); /* libc allocator -- see cmark_parser_new() vs _with_mem() */
 	php_mdhtml_id_list_destroy(&heading_ids);
+
+	if (plugin_outputs.count > 0) {
+		zend_string *injected = php_mdhtml_inject_plugins(result, &plugin_outputs);
+		zend_string_release(result);
+		result = injected;
+	}
+	php_mdhtml_plugin_outputs_destroy(&plugin_outputs);
 
 	RETVAL_STR(result);
 }
@@ -1231,9 +1543,84 @@ PHP_FUNCTION(mdhtml_register_emoji)
 	zend_string_release(key);
 }
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_mdhtml_register_plugin, 0, 2, IS_VOID, 0)
+	ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+/* MDHtml\RegisterPlugin('name', $callback) -- request-scoped, mirrors
+ * MD::registerPlugin(). $callback is called as ($args, $body) exactly
+ * like MD:: documents; stored as a plain zval (not a zend_fcall_info/
+ * cache pair) so it can be looked up and invoked later, well after this
+ * function's own call frame is gone. */
+PHP_FUNCTION(mdhtml_register_plugin)
+{
+	zend_string *name;
+	zval *callback;
+	zend_string *key;
+	zval callback_copy;
+
+	ZEND_PARSE_PARAMETERS_START(2, 2)
+		Z_PARAM_STR(name)
+		Z_PARAM_ZVAL(callback)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (!zend_is_callable(callback, 0, NULL)) {
+		zend_argument_type_error(2, "must be a valid callback");
+		RETURN_THROWS();
+	}
+
+	key = zend_string_init(ZSTR_VAL(name), ZSTR_LEN(name), 0);
+	zend_str_tolower(ZSTR_VAL(key), ZSTR_LEN(key));
+
+	ZVAL_COPY(&callback_copy, callback);
+	zend_hash_update(&MDHTML_G(plugins), key, &callback_copy);
+	zend_string_release(key);
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_mdhtml_unregister_plugin, 0, 1, IS_VOID, 0)
+	ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+/* MDHtml\UnregisterPlugin('name') -- mirrors MD::unregisterPlugin(). */
+PHP_FUNCTION(mdhtml_unregister_plugin)
+{
+	zend_string *name;
+	zend_string *key;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_STR(name)
+	ZEND_PARSE_PARAMETERS_END();
+
+	key = zend_string_init(ZSTR_VAL(name), ZSTR_LEN(name), 0);
+	zend_str_tolower(ZSTR_VAL(key), ZSTR_LEN(key));
+	zend_hash_del(&MDHTML_G(plugins), key);
+	zend_string_release(key);
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_mdhtml_get_registered_plugins, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+/* MDHtml\GetRegisteredPlugins(): array -- mirrors
+ * MD::getRegisteredPlugins(). */
+PHP_FUNCTION(mdhtml_get_registered_plugins)
+{
+	zend_string *key;
+
+	ZEND_PARSE_PARAMETERS_NONE();
+
+	array_init(return_value);
+	ZEND_HASH_FOREACH_STR_KEY(&MDHTML_G(plugins), key) {
+		add_next_index_str(return_value, zend_string_copy(key));
+	} ZEND_HASH_FOREACH_END();
+}
+
 static const zend_function_entry mdhtml_functions[] = {
 	ZEND_NS_NAMED_FE("MDHtml", Render, PHP_FN(mdhtml_render), arginfo_mdhtml_render)
 	ZEND_NS_NAMED_FE("MDHtml", RegisterEmoji, PHP_FN(mdhtml_register_emoji), arginfo_mdhtml_register_emoji)
+	ZEND_NS_NAMED_FE("MDHtml", RegisterPlugin, PHP_FN(mdhtml_register_plugin), arginfo_mdhtml_register_plugin)
+	ZEND_NS_NAMED_FE("MDHtml", UnregisterPlugin, PHP_FN(mdhtml_unregister_plugin), arginfo_mdhtml_unregister_plugin)
+	ZEND_NS_NAMED_FE("MDHtml", GetRegisteredPlugins, PHP_FN(mdhtml_get_registered_plugins), arginfo_mdhtml_get_registered_plugins)
 	PHP_FE_END
 };
 
@@ -1265,12 +1652,14 @@ PHP_MSHUTDOWN_FUNCTION(mdhtml)
 PHP_RINIT_FUNCTION(mdhtml)
 {
 	zend_hash_init(&MDHTML_G(emoji_custom), 8, NULL, php_mdhtml_emoji_dtor, 0);
+	zend_hash_init(&MDHTML_G(plugins), 8, NULL, ZVAL_PTR_DTOR, 0);
 	return SUCCESS;
 }
 
 PHP_RSHUTDOWN_FUNCTION(mdhtml)
 {
 	zend_hash_destroy(&MDHTML_G(emoji_custom));
+	zend_hash_destroy(&MDHTML_G(plugins));
 	return SUCCESS;
 }
 

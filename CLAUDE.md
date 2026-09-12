@@ -263,6 +263,85 @@ much less fragile.
     forcing a byte-for-byte replica of `MD::`'s custom one; revisit only
     if some other part of kirigami turns out to depend on the exact
     `fn:label`/`div` shape (not found so far).
+12. **The `{% plugin %}` system moved into the extension too**
+    (maintainer, 2026-09-12 — "on peut pas faire de registerPlugin?" — a
+    direct follow-up to point 10's "as much as possible in C" mandate,
+    which had left this on the "needs a PHP callback round-trip, bigger
+    undertaking" pile). Implemented as a synchronous PHP callback
+    round-trip from C, same overall shape as points 10/11 already
+    established, not a real `cmark_syntax_extension`:
+    - `MDHtml\RegisterPlugin(string $name, callable $callback): void`,
+      `MDHtml\UnregisterPlugin(string $name): void`, and
+      `MDHtml\GetRegisteredPlugins(): array` mirror `MD::registerPlugin()`/
+      `unregisterPlugin()`/`getRegisteredPlugins()` exactly. Callbacks are
+      stored as plain `zval`s (refcounted via `ZVAL_COPY`) in a third,
+      request-scoped `HashTable` (`MDHTML_G(plugins)`, same `RINIT`/
+      `RSHUTDOWN` pattern as `emoji_custom`) — not a `zend_fcall_info`/
+      `_cache` pair, since those reference transient call-frame state and
+      this callback must survive to be invoked much later, well after
+      `RegisterPlugin()`'s own call frame is gone. Validated with
+      `zend_is_callable()` at registration time (throws a `TypeError` via
+      `zend_argument_type_error()` otherwise, matching what a real
+      `callable`-typed engine parameter would do).
+    - `php_mdhtml_extract_plugins()` scans the *raw Markdown string* for
+      `{% name args %}` / `{% name args\nbody\n%}` spans — before any
+      cmark parsing happens, same as `MD::`'s own STEP 2, and for the same
+      reason: there is no tree yet to hook a real syntax extension into,
+      and a real one would still need this same callback-into-PHP
+      machinery for the body. For each registered name, calls the stored
+      callback via `call_user_function()` with `($args, $body)`
+      (`$args` built by `php_mdhtml_parse_plugin_args()`, a C port of
+      `MD::`'s `$parseArgs` closure — bare words, `"double"`/`'single'`
+      quoted with backslash escapes), stringifies the return value
+      (`zval_get_string()`), and replaces the matched span with an
+      `\x02PLG<n>\x03` placeholder (same STX/ETX control-byte convention
+      `MD::` uses — bytes with no Markdown meaning of their own, so cmark
+      carries them through its own text-escaping completely unchanged).
+      An **unregistered** name is left completely untouched in the
+      Markdown — unlike `MD::`, which explicitly `htmlspecialchars()`s an
+      unknown tag, this doesn't need to: cmark's own text-node HTML
+      escaping already makes a literal `{% unknown %}` safe once it's
+      just ordinary paragraph text.
+    - `php_mdhtml_inject_plugins()` runs *after* `cmark_render_html()` and
+      `php_mdhtml_postprocess()`, substituting each placeholder for its
+      real output. **The one genuinely tricky part**: a block-style
+      plugin used on its own line ends up as the *entire* content of a
+      `<p>...</p>` once cmark renders it — if left alone, a plugin
+      returning block-level HTML (a `<div>`, an `<iframe>`, ...) would end
+      up illegally nested inside that `<p>`. `MD::` avoids this via its
+      own STEP 13 paragraph-wrapping logic, which special-cases a line
+      starting with `\x02PLG` as a "block line" to never wrap. Since
+      `php_mdhtml_inject_plugins()` runs on the *already-rendered* HTML
+      (cmark did the wrapping already, unaware any of this was coming),
+      the fix has to happen the other way around: detect a placeholder
+      immediately preceded by `<p>` (checking the last 3 bytes already
+      written to the output buffer) and immediately followed by `</p>`,
+      and in that case emit the plugin's raw output in place of the whole
+      `<p>PLACEHOLDER</p>`, not just the placeholder. Verified directly —
+      a block-style `checklist` plugin (multi-line body) comes out
+      correctly unwrapped (`<div class="checklist">...</div>`, no
+      surrounding `<p>`), while an inline `{% codepen %}` used mid-sentence
+      stays correctly inline inside its paragraph.
+    - **Known, deliberate limitation, unlike `MD::`**: a `{% %}` tag
+      written *inside* a code span/block in the source markdown is only
+      protected from being treated as a live plugin invocation for
+      ```` ``` ```` fenced blocks (tracked via a simple "does this line
+      start with ```` ``` ````" toggle maintained during the same scan).
+      A single-backtick inline code span containing literal `{% %}` text
+      is **not** currently excluded and would still fire the plugin.
+      `MD::` protects against this unconditionally (it extracts first,
+      then swaps back to literal text if the placeholder later turns out
+      to have landed inside extracted code). Verified the fenced-block
+      case works (`` ``` \n{% codepen abc %}\n``` `` renders the tag
+      literally, `{% codepen abc %}` used for real right after still
+      renders the plugin) — the inline-span gap is undocumented-but-real,
+      revisit if it matters in practice (e.g. documentation *about* the
+      plugin syntax written in a single-backtick span).
+    - Verified end-to-end with inline usage embedded mid-sentence, a
+      multi-line block usage, an unregistered name (stays literal),
+      `GetRegisteredPlugins()` before/after `UnregisterPlugin()`, and the
+      fenced-code-block protection above — all via a throwaway
+      `vendor/build/test.php`/`fence-test.php` (scratch, not committed).
 
 ## Relationship to other repos
 
@@ -334,19 +413,28 @@ both the feature smoke test (`vendor/build/test.php`) and the full diff
 corpus (`vendor/build/diff-test.php`, both scratch files, not committed)
 against a real checkout of `../kirigami`.
 
+**✅ Round 3 (2026-09-12, point 12 above): the `{% plugin %}` system moved
+into the extension.** `MDHtml\RegisterPlugin()`/`UnregisterPlugin()`/
+`GetRegisteredPlugins()`, a raw-Markdown-string pre-scan calling
+registered callbacks via `call_user_function()`, and a post-render
+placeholder substitution with a paragraph-unwrap fix-up for block-style
+plugins. Verified: inline usage, block usage (correctly unwrapped from
+its `<p>`), an unregistered name (stays literal), register/unregister
+round-trip, and the ```` ``` ```` fenced-code-block protection.
+
 **Not done yet:**
 
-1. The `{% plugin %}` system, definition lists, GFM-style `> [!NOTE]`
-   alerts, and the `==highlight==`/`^sup^`/`~sub~` extended inline syntax
-   (point 10's "still PHP-side" list) — `MD::toHtml()` keeps doing these
-   in PHP for now. Plugins specifically need a PHP callback round-trip
-   from C (`zend_call_function()` from inside a custom
-   `cmark_syntax_extension` match callback, or a block/inline extension
-   dispatching to registered closures) — a bigger, separate undertaking;
-   the other three could reuse the `CMARK_NODE_CUSTOM_INLINE` splice
-   pattern point 10 sketched out but didn't implement.
-2. Decide the plugin/callback hook question (point 4) once a real gap
-   shows up in practice, not before.
+1. Definition lists, GFM-style `> [!NOTE]` alerts, and the
+   `==highlight==`/`^sup^`/`~sub~` extended inline syntax (point 10's
+   "still PHP-side" list, now minus plugins) — `MD::toHtml()` keeps doing
+   these in PHP for now. All three could reuse the
+   `CMARK_NODE_CUSTOM_INLINE` splice pattern point 10 sketched out but
+   didn't implement (a text node split around the delimiter, wrapping the
+   captured content in a custom node whose `on_enter`/`on_exit` are
+   literal `<mark>`/`</mark>` etc.).
+2. Point 12's known limitation: a `{% %}` written inside a single-
+   backtick inline code span isn't protected from being treated as a live
+   plugin invocation (only ```` ``` ```` fenced blocks are).
 3. `php_mdhtml_slugify()`'s ASCII-only limitation (point 10) — revisit if
    a real non-ASCII heading anchor is needed.
 4. Only once the remaining PHP-side features above are either migrated or
