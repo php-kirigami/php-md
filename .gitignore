@@ -27,10 +27,18 @@
 *.la
 *.dep
 
-# vendored third-party dependency sources/builds (decision 5 in CLAUDE.md —
-# not yet decided whether this lives here or in php-wasm-compiler, either
-# way nothing under vendor/ is hand-edited)
-/vendor/
+# libcmark-gfm's downloaded source + built library (rebuilt fresh by
+# vendor/build/stage.sh every time — see CLAUDE.md decision 5); the
+# staging script itself is real, committed dev tooling, not vendored
+# output, so it's intentionally not excluded here.
+/vendor/build/*.tar.gz
+/vendor/build/src/
+/vendor/libcmark-gfm/
+
+# scratch test scripts used during development, not part of the repo
+/vendor/build/test*.php
+/vendor/build/diff-test.php
+/vendor/build/fence-test.php
 
 # editor/OS noise
 .vscode/

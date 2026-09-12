@@ -15,7 +15,7 @@
 extern zend_module_entry mdhtml_module_entry;
 #define phpext_mdhtml_ptr &mdhtml_module_entry
 
-#define PHP_MDHTML_VERSION "0.1.0-dev"
+#define PHP_MDHTML_VERSION "0.1.0"
 
 #ifdef PHP_WIN32
 # define PHP_MDHTML_API __declspec(dllexport)

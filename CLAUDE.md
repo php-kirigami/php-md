@@ -94,25 +94,34 @@ much less fragile.
      if placeholder-based extraction proves insufficient in practice
      (e.g. a plugin needing to influence surrounding Markdown parsing
      rather than just injecting opaque HTML).
-5. **`libcmark-gfm` vendoring location: not yet decided.** Two options:
-   - **(A) — leaning towards this.** php-mdhtml vendors and cross-compiles
-     `libcmark-gfm` + `libcmark-gfm-extensions` itself, as part of its own
-     build, following `@php-wasm/compile-extension`'s documented
-     dependency pattern (vendor the source, build it with Emscripten
-     yourself, pass `--extra-cflags`/`--extra-ldflags` pointing at the
-     result — see `php-wasm-compiler` CLAUDE.md decision 32's `sodium`
-     pilot for the exact mechanism, `vendorLib`/`pkgConfigVar`). Keeps
-     php-mdhtml fully self-contained, consistent with the
-     `@kirigami/ext-<name>` standalone-package philosophy
-     (`php-wasm-compiler` CLAUDE.md decision 5).
-   - (B) `php-wasm-compiler`'s `compile/libcmark/Dockerfile` (currently
-     vendors plain `cmark` for the now-likely-to-be-retired
-     `krakjoe/cmark` static-mode extension) gets replaced/repointed at
-     `cmark-gfm` instead, and php-mdhtml's `config.m4` consumes it exactly the
-     way `ext/sodium` does today.
-   - Not decided yet — revisit once php-mdhtml compiles and passes output-
-     parity tests natively (point 6), before touching Emscripten/WASM at
-     all.
+5. **`libcmark-gfm` vendoring location: decided (2026-09-12) — option B,
+   php-wasm-compiler side, `mode: static`.** Originally two options were on
+   the table:
+   - (A) php-mdhtml vendors and cross-compiles `libcmark-gfm` +
+     `libcmark-gfm-extensions` itself, following
+     `@php-wasm/compile-extension`'s documented dependency pattern.
+   - **(B) — chosen.** `php-wasm-compiler` gets a *new*
+     `compile/libcmark-gfm/Dockerfile` (alongside, not replacing, the
+     existing plain-`cmark` one still used by the separate `krakjoe/cmark`
+     `cmark` extension — no decision yet to retire that one), and
+     `config.m4` was changed (see below) to consume it exactly the way
+     `ext/sodium`/`ext/yaml`/`ext/cmark` already do:
+     `--with-mdhtml=/root/lib`.
+   - **`config.m4` switched from `PHP_ARG_ENABLE` to `PHP_ARG_WITH`** to
+     make this possible: `--with-mdhtml[=DIR]` — bare (or `--enable-mdhtml`
+     for backward compat is *not* kept, since `PHP_ARG_ENABLE` and
+     `PHP_ARG_WITH` produce differently-shaped configure options; this is a
+     breaking rename of the flag) defaults `DIR` to the local
+     `vendor/libcmark-gfm` (native dev, staged by `vendor/build/stage.sh`,
+     unchanged); an explicit `DIR` (e.g. `/root/lib`, php-wasm-compiler's
+     own convention for every other vendored lib) points at an
+     externally-staged `libcmark-gfm` instead. One `config.m4`, two
+     consumers, no duplication.
+   - `PHP_MDHTML_VERSION` bumped from `"0.1.0-dev"` to a real `"0.1.0"`,
+     tagged `v0.1.0` and pushed — `php-wasm-compiler`'s Dockerfile
+     downloads a tagged GitHub release tarball for every vendored
+     extension source (yaml, cmark), and php-mdhtml needed its first real
+     tag to fit that same convention.
 6. **Native build first, WASM/JSPI second.** Target is ultimately PHP 8.5
    under Emscripten/JSPI (matching `php-wasm-compiler`'s own `php.wasm`),
    but the extension should build as a normal `.so` against a regular
