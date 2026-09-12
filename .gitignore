@@ -25,6 +25,7 @@
 *.o
 *.so
 *.la
+*.dep
 
 # vendored third-party dependency sources/builds (decision 5 in CLAUDE.md —
 # not yet decided whether this lives here or in php-wasm-compiler, either

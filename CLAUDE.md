@@ -39,15 +39,20 @@ much less fragile.
    syntax-extension attachment API (`cmark_parser_attach_syntax_extension`).
    Verified 2026-09-12 by listing `github/cmark-gfm`'s `extensions/`
    directory: `autolink`, `strikethrough`, `table`, `tagfilter`,
-   `tasklist` — **no footnotes extension** (GitHub's footnote rendering is
-   server-side, never shipped in the C library). `MD::`'s existing
-   footnote pre/post-processing is not something this extension can
-   subsume — see point 3.
+   `tasklist` — no footnotes *extension*. **Correction, same day**:
+   footnotes turned out not to need one — `cmark-gfm`'s core library
+   (`src/footnotes.c`, not `extensions/`) supports GitHub-style `[^label]`
+   footnotes natively via a parser option, `CMARK_OPT_FOOTNOTES`, found
+   while building the library and confirmed working end-to-end in the
+   first native smoke test (see "Status"). So footnotes *are* covered by
+   this extension after all — one less thing `MD::` needs to pre/post-
+   process in PHP; point 3's footnote bullet is superseded by this.
 3. **Must reproduce `MD::toHtml()`'s exact behavior/output** — this is the
    compatibility bar, not a green-field design. Concretely, this extension
    covers *only* the CommonMark+GFM structural core: headings (ATX +
    Setext), emphasis/strong, lists, blockquotes, code spans/blocks, links,
-   images, thematic breaks, tables, tasklists, strikethrough, autolinks.
+   images, thematic breaks, tables, tasklists, strikethrough, autolinks,
+   and footnotes (point 2's correction).
    Everything `MD::` does that `cmark-gfm` has no concept of stays
    implemented in PHP, as pre/post-processing around this extension's
    render call, exactly as it works today:
@@ -55,7 +60,6 @@ much less fragile.
      `MD::registerPlugin()`)
    - `:shortcode:` emoji substitution
    - definition lists (`Term` / `: Definition`)
-   - footnote definitions/references (`[^label]`)
    - GFM-style alerts (`> [!NOTE]`, `[!TIP]`, etc. — GitHub's own
      proprietary convention, not part of cmark-gfm)
    - the custom raw-HTML whitelist sanitizer (stricter/different from
@@ -146,19 +150,60 @@ much less fragile.
 
 ## Status (2026-09-12)
 
-Repo just created, nothing implemented yet. Next steps, in order:
+**✅ First native build succeeds and produces correct output.** Built and
+tested end-to-end natively (WSL Ubuntu 26.04, PHP 8.5.4, cc 15.2.0,
+cmake 4.2.3 — no Emscripten/Docker involved, per point 6):
 
-1. Scaffold a minimal, compilable extension stub (`config.m4` + one
-   placeholder function) buildable against a *native* PHP 8.5 (no
-   Emscripten yet) for fast local iteration.
-2. Vendor + build `libcmark-gfm` / `libcmark-gfm-extensions` natively (not
-   WASM yet) and implement the real `MD\Render()`: parse via
-   `cmark_parser_new()` with the GFM extensions attached, render via
-   `cmark_render_html()`.
-3. Diff-test against `MD::toHtml()`'s current output on a representative
-   Markdown corpus (decision 3's compatibility bar) — CommonMark/GFM
-   structural features only; the PHP-side pre/post-processing in `MD::`
-   stays untouched and is not part of this repo.
-4. Only once the native build and output parity are solid: port the build
-   to Emscripten/WASM (JSPI), following `php-wasm-compiler`'s own
-   Dockerfile conventions, and settle the vendoring question (point 5).
+- `vendor/build/stage.sh` (not committed, regenerated on demand — see
+  `.gitignore`): downloads `github/cmark-gfm` tag `0.29.0.gfm.13`, builds
+  `libcmark-gfm_static` + `libcmark-gfm-extensions_static` via CMake
+  (needed `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` — the upstream
+  `CMakeLists.txt`'s own minimum predates CMake 4.x, which dropped that
+  compatibility), and stages the two `.a` files plus the public headers
+  into `vendor/libcmark-gfm/{include,lib}`.
+- `config.m4` links against the staged `vendor/libcmark-gfm` via
+  `PHP_ADD_INCLUDE`/`PHP_ADD_LIBRARY_WITH_PATH` (relative paths — an
+  earlier attempt using `$ext_srcdir` failed the `test -f` guard, since
+  that variable isn't set yet at the point `PHP_ARG_ENABLE` runs in a
+  standalone `phpize` build; config.m4 already executes with cwd at the
+  extension root, so plain relative paths are correct here).
+- `md.c` now implements the real `MD\Render()`: registers the GFM
+  extensions once (`cmark_gfm_core_extensions_ensure_registered()`),
+  attaches `table`/`strikethrough`/`autolink`/`tagfilter`/`tasklist` to a
+  `cmark_parser_new(CMARK_OPT_UNSAFE | CMARK_OPT_FOOTNOTES)`, feeds it the
+  input, and renders via `cmark_render_html()` — passing
+  `cmark_parser_get_syntax_extensions(parser)` so extension node types
+  (tables, tasklists, strikethrough) actually get rendered rather than
+  silently dropped. `CMARK_OPT_UNSAFE` is deliberate: raw HTML passes
+  through untouched for `MD::`'s own stricter whitelist sanitizer to
+  handle afterward, matching what `MD::toHtml()` already does today.
+  cmark's returned buffer is freed with plain `free()` (not `efree()`) —
+  it came from the default libc-based allocator, since `cmark_parser_new()`
+  (not `_with_mem()`) was used.
+- Smoke-tested with a single Markdown sample covering every structural
+  feature in scope (headings, bold/italic, links, nested lists, task
+  list checkboxes, a table, strikethrough, an autolink, a blockquote, a
+  fenced code block with a language class, and a footnote
+  definition/reference): every feature rendered correctly, footnotes
+  included (see point 2's correction — no PHP-side handling needed for
+  those after all).
+
+**Not done yet:**
+
+1. Diff-test against `MD::toHtml()`'s *actual current* output (not just
+   "looks right by eye") on a representative Markdown corpus — decision
+   3's compatibility bar. In particular: check `MD::`'s existing output
+   for headings (it adds `id="slug"` for anchors — `cmark-gfm` does not,
+   that stays a PHP-side post-process per decision 3), tables/tasklists'
+   exact HTML shape (cmark-gfm's task items render as
+   `<li><input type="checkbox" checked="" disabled="" /> ...</li>` —
+   compare against `MD::`'s own `class="task-item"` convention, decide
+   whether `MD::` adapts to cmark-gfm's shape or a small post-process
+   normalizes it), and footnote HTML shape (cmark-gfm wraps them in a
+   `<section class="footnotes" data-footnotes>` block with backref links
+   — compare against `MD::`'s current simpler footnote rendering).
+2. Decide the plugin/callback hook question (point 4) once a real gap
+   shows up in practice, not before.
+3. Only once native output parity is solid: port the build to
+   Emscripten/WASM (JSPI), following `php-wasm-compiler`'s own Dockerfile
+   conventions, and settle the vendoring question (point 5).

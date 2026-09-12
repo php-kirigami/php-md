@@ -17,30 +17,75 @@
 #include "ext/standard/info.h"
 #include "php_md.h"
 
+#include <cmark-gfm.h>
+#include <cmark-gfm-core-extensions.h>
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_md_render, 0, 1, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO(0, markdown, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+/* GFM extensions attached to every parse. No footnotes extension here —
+ * cmark-gfm supports footnotes as a core parser option (CMARK_OPT_FOOTNOTES),
+ * not a syntax_extension (verified against its own src/footnotes.c, which
+ * lives in src/ rather than extensions/). See CLAUDE.md decision 2. */
+static const char *php_md_gfm_extensions[] = {
+	"table", "strikethrough", "autolink", "tagfilter", "tasklist", NULL
+};
+
 /*
- * Placeholder only (see CLAUDE.md "Status"): the real implementation
- * parses via cmark-gfm (cmark_parser_new() with the GFM syntax extensions
- * attached) and renders via cmark_render_html(), covering only the
- * CommonMark+GFM structural core — everything else MD::toHtml() does
- * (plugins, emoji, footnotes, alerts, the raw-HTML whitelist) stays in
- * PHP and is unaffected by this extension. For now this just proves the
- * extension loads and the namespaced MD\Render() function resolves
- * correctly, distinct from (and not colliding with) the global \MD class
- * in kirigami/php-prepros.
+ * Covers only the CommonMark+GFM structural core (see CLAUDE.md decision
+ * 3) — everything else MD::toHtml() does (plugins, emoji, definition
+ * lists, GFM-style alerts, the raw-HTML whitelist, heading slugs) stays
+ * in PHP and is unaffected by this extension. Deliberately returns a
+ * plain HTML string rather than exposing any node tree to PHP (decision
+ * 4) — no zend_object involved on the cmark side at all.
+ *
+ * CMARK_OPT_UNSAFE lets raw HTML through unescaped: MD::toHtml() applies
+ * its own, stricter whitelist-based sanitizer afterward (it already does
+ * this today for its hand-rolled parser), so this extension must not
+ * pre-filter or escape raw HTML itself.
  */
 PHP_FUNCTION(md_render)
 {
 	zend_string *markdown;
+	cmark_parser *parser;
+	cmark_node *document;
+	char *html;
+	int options = CMARK_OPT_UNSAFE | CMARK_OPT_FOOTNOTES;
+	int i;
 
 	ZEND_PARSE_PARAMETERS_START(1, 1)
 		Z_PARAM_STR(markdown)
 	ZEND_PARSE_PARAMETERS_END();
 
-	RETURN_STR_COPY(markdown);
+	cmark_gfm_core_extensions_ensure_registered();
+
+	parser = cmark_parser_new(options);
+
+	for (i = 0; php_md_gfm_extensions[i]; i++) {
+		cmark_syntax_extension *ext = cmark_find_syntax_extension(php_md_gfm_extensions[i]);
+		if (ext) {
+			cmark_parser_attach_syntax_extension(parser, ext);
+		}
+	}
+
+	cmark_parser_feed(parser, ZSTR_VAL(markdown), ZSTR_LEN(markdown));
+	document = cmark_parser_finish(parser);
+
+	html = cmark_render_html(document, options, cmark_parser_get_syntax_extensions(parser));
+
+	cmark_node_free(document);
+	cmark_parser_free(parser);
+
+	if (!html) {
+		RETURN_EMPTY_STRING();
+	}
+
+	/* cmark_render_html allocates with the default (libc) allocator since
+	 * we used cmark_parser_new() rather than cmark_parser_new_with_mem() —
+	 * must free() it, not efree(), after copying into a zend_string. */
+	RETVAL_STRING(html);
+	free(html);
 }
 
 static const zend_function_entry md_functions[] = {
